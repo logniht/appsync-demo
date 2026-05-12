@@ -1,0 +1,255 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Demo - Dashboard Real-Time con AWS AppSync Events
+  Despliega: Event API + Channel Namespaces + API Key + Lambda publisher +
+  IAM roles + EventBridge Scheduler (rate 1 minute)
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: appsync-events-demo
+    Description: Prefijo usado para nombrar los recursos
+    AllowedPattern: '[a-z0-9-]+'
+
+  ApiKeyExpiresEpoch:
+    Type: Number
+    Default: 0
+    Description: >
+      Epoch en segundos cuando expira la API Key. Si se deja en 0, se usa el
+      default de AppSync (7 dias). deploy.sh calcula automaticamente "ahora +
+      N dias" y lo pasa como override.
+
+  ScheduleExpression:
+    Type: String
+    Default: rate(1 minute)
+    Description: Frecuencia con la que la Lambda publica metricas
+
+Conditions:
+  UseDefaultApiKeyExpiration: !Equals [!Ref ApiKeyExpiresEpoch, 0]
+
+Resources:
+
+  # -------------------------------------------------------------------------
+  # AppSync Event API
+  # Conexion y subscribe con API Key (para el frontend Amplify).
+  # Publish con IAM (la Lambda firma SigV4; no hay secretos en env).
+  # -------------------------------------------------------------------------
+  EventApi:
+    Type: AWS::AppSync::Api
+    Properties:
+      Name: !Sub '${ProjectName}-api'
+      EventConfig:
+        AuthProviders:
+          - AuthType: API_KEY
+          - AuthType: AWS_IAM
+        ConnectionAuthModes:
+          - AuthType: API_KEY
+        DefaultPublishAuthModes:
+          - AuthType: AWS_IAM
+        DefaultSubscribeAuthModes:
+          - AuthType: API_KEY
+
+  EventApiKey:
+    Type: AWS::AppSync::ApiKey
+    Properties:
+      ApiId: !GetAtt EventApi.ApiId
+      Description: Demo API Key
+      # Si ApiKeyExpiresEpoch es 0 (default), omitimos Expires y AppSync usa
+      # 7 dias. deploy.sh calcula "now + N dias" y lo pasa como override.
+      Expires: !If [UseDefaultApiKeyExpiration, !Ref AWS::NoValue, !Ref ApiKeyExpiresEpoch]
+
+  # -------------------------------------------------------------------------
+  # Channel Namespaces
+  # Los namespaces son el primer segmento de la ruta del canal:
+  #   /dashboard/metrics     -> namespace "dashboard"
+  #   /notifications/alerts  -> namespace "notifications"
+  # -------------------------------------------------------------------------
+  DashboardNamespace:
+    Type: AWS::AppSync::ChannelNamespace
+    Properties:
+      ApiId: !GetAtt EventApi.ApiId
+      Name: dashboard
+
+  NotificationsNamespace:
+    Type: AWS::AppSync::ChannelNamespace
+    Properties:
+      ApiId: !GetAtt EventApi.ApiId
+      Name: notifications
+
+  # -------------------------------------------------------------------------
+  # Lambda Publisher
+  # -------------------------------------------------------------------------
+  PublisherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-publisher-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AppSyncEventsPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: appsync:EventPublish
+                Resource: !Sub 'arn:${AWS::Partition}:appsync:${AWS::Region}:${AWS::AccountId}:apis/${EventApi.ApiId}/channelNamespace/*'
+
+  PublisherFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-publisher'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt PublisherRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          EVENT_API_HTTP_DNS: !GetAtt EventApi.Dns.Http
+      Code:
+        ZipFile: |
+          """
+          Lambda Publisher para AppSync Events.
+          Publica eventos al endpoint HTTP usando IAM auth (SigV4).
+          """
+          import json
+          import os
+          import random
+          import urllib.request
+          from datetime import datetime, timezone
+
+          import boto3
+          from botocore.auth import SigV4Auth
+          from botocore.awsrequest import AWSRequest
+
+          REGION = os.environ['AWS_REGION']
+          PUBLISH_URL = f"https://{os.environ['EVENT_API_HTTP_DNS']}/event"
+
+          _credentials = boto3.Session().get_credentials()
+
+
+          def publish(channel, payload):
+              body = json.dumps({
+                  'channel': channel,
+                  'events': [json.dumps(payload)],
+              }).encode('utf-8')
+
+              request = AWSRequest(
+                  method='POST',
+                  url=PUBLISH_URL,
+                  data=body,
+                  headers={'Content-Type': 'application/json'},
+              )
+              SigV4Auth(_credentials, 'appsync', REGION).add_auth(request)
+
+              req = urllib.request.Request(
+                  PUBLISH_URL,
+                  data=body,
+                  headers=dict(request.headers.items()),
+                  method='POST',
+              )
+              with urllib.request.urlopen(req, timeout=10) as resp:
+                  print(f'Publicado en {channel}: HTTP {resp.status}')
+
+
+          def generate_metrics():
+              return {
+                  'cpu': round(random.uniform(20, 95), 2),
+                  'memory': round(random.uniform(30, 85), 2),
+                  'disk': round(random.uniform(40, 75), 2),
+                  'network_in': random.randint(100, 5000),
+                  'network_out': random.randint(50, 3000),
+                  'timestamp': datetime.now(timezone.utc).isoformat(),
+                  'region': REGION,
+                  'instance_id': 'i-1234567890abcdef0',
+              }
+
+
+          def lambda_handler(event, context):
+              metrics = generate_metrics()
+              print(f'Publicando metricas: {json.dumps(metrics)}')
+
+              publish('/dashboard/metrics', metrics)
+
+              if metrics['cpu'] > 80:
+                  publish('/notifications/alerts', {
+                      'type': 'warning',
+                      'message': f"CPU alta: {metrics['cpu']}%",
+                      'timestamp': metrics['timestamp'],
+                  })
+
+              return {'statusCode': 200, 'body': json.dumps({'ok': True, 'metrics': metrics})}
+
+  PublisherLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${PublisherFunction}'
+      RetentionInDays: 7
+
+  # -------------------------------------------------------------------------
+  # EventBridge Scheduler (invoca la Lambda cada minuto)
+  # -------------------------------------------------------------------------
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-scheduler-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokePublisherLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt PublisherFunction.Arn
+
+  PublisherSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${ProjectName}-schedule'
+      Description: Invoca la Lambda publisher segun ScheduleExpression
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Target:
+        Arn: !GetAtt PublisherFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+
+Outputs:
+  EventApiId:
+    Description: ID del Event API (uselo en la Lambda si la invocas fuera)
+    Value: !GetAtt EventApi.ApiId
+
+  HttpEndpoint:
+    Description: Endpoint HTTP/WebSocket para Amplify (el cliente deriva el wss automaticamente)
+    Value: !Sub 'https://${EventApi.Dns.Http}/event'
+
+  RealtimeEndpoint:
+    Description: Endpoint WebSocket directo (solo informativo)
+    Value: !Sub 'wss://${EventApi.Dns.Realtime}/event/realtime'
+
+  ApiKey:
+    Description: API Key para autenticar el cliente Amplify
+    Value: !GetAtt EventApiKey.ApiKey
+
+  PublisherFunctionName:
+    Description: Nombre de la Lambda publisher
+    Value: !Ref PublisherFunction
+
+  ScheduleName:
+    Description: Nombre del schedule de EventBridge
+    Value: !Ref PublisherSchedule

@@ -11,9 +11,9 @@ import { events } from 'aws-amplify/data';
 // Configuración del Event API (reemplazar con tus valores)
 // El endpoint HTTP termina en /event - Amplify deriva el WebSocket automáticamente
 const CONFIG = {
-    endpoint: 'https://7hr3f7mqgndahncyjtnsktgdxm.appsync-api.eu-west-1.amazonaws.com/event',
+    endpoint: 'https://XXXXXXXXXXXXXXXXXXXXXXX.appsync-api.eu-west-1.amazonaws.com/event',
     region: 'eu-west-1',
-    apiKey: 'da2-un76ov47ejdhpkciasbbxro4x4'
+    apiKey: 'da2-xxxxxxxxxxxxxxxxxxxxxxxx'
 };
 
 Amplify.configure({
